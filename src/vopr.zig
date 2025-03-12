@@ -372,7 +372,7 @@ pub fn main() !void {
         {
             var replica: u8 = 0;
             while (replica < replica_count) : (replica += 1) simulator.core.set(replica);
-            simulator.transition_to_liveness_mode();
+            simulator.transition_to_liveness_mode(simulator.core);
 
             tick = 0;
             while (tick < 500_000) : (tick += 1) simulator.tick();
@@ -392,12 +392,12 @@ pub fn main() !void {
     if (cli_args.lite) return;
 
     simulator.core = random_core(
-        simulator.random,
+        simulator.prng,
         simulator.options.cluster.replica_count,
         simulator.options.cluster.standby_count,
     );
 
-    simulator.transition_to_liveness_mode();
+    simulator.transition_to_liveness_mode(simulator.core);
 
     // Liveness: a core set of replicas is up and fully connected. The rest of replicas might be
     // crashed or partitioned permanently. The core should converge to the same state.
@@ -654,18 +654,10 @@ pub const Simulator = struct {
     ///
     /// See https://tigerbeetle.com/blog/2023-07-06-simulation-testing-for-liveness for broader
     /// context.
-    pub fn transition_to_liveness_mode(simulator: *Simulator) void {
-<<<<<<< HEAD
-        simulator.core = random_core(
-            simulator.prng,
-            simulator.options.cluster.replica_count,
-            simulator.options.cluster.standby_count,
-        );
-=======
->>>>>>> aaabbe599 (vopr: search for correlated faults after safety mode)
-        log.debug("transition_to_liveness_mode: core={b}", .{simulator.core.mask});
+    pub fn transition_to_liveness_mode(simulator: *Simulator, core: Core) void {
+        log.debug("transition_to_liveness_mode: core={b}", .{core.mask});
 
-        var it = simulator.core.iterator(.{});
+        var it = core.iterator(.{});
         while (it.next()) |replica_index| {
             const fault = false;
             if (simulator.cluster.replica_health[replica_index] == .down) {
@@ -750,24 +742,24 @@ pub const Simulator = struct {
         assert(simulator.core.count() > 0);
         const replica_count = simulator.options.cluster.replica_count;
 
-        var cluster_op_checkpoint: u64 = 0;
         var cluster_op_head: u64 = 0;
-        var cluster_op_repair_min: u64 = 0;
+        var op_repair_min: ?u64 = 0;
         for (simulator.cluster.replicas) |*replica| {
             if (simulator.core.isSet(replica.replica)) {
                 if (replica.standby()) continue;
                 if (!simulator.core.isSet(replica.replica)) continue;
                 if (replica.status == .recovering_head) continue;
 
-                cluster_op_checkpoint = @max(
-                    cluster_op_checkpoint,
-                    replica.superblock.working.vsr_state.checkpoint.header.op,
-                );
                 cluster_op_head = @max(cluster_op_head, replica.op);
-                cluster_op_repair_min = @min(cluster_op_repair_min, replica.op_repair_min());
+                if (op_repair_min == null) {
+                    op_repair_min = replica.op_repair_min();
+                } else {
+                    op_repair_min = @min(op_repair_min.?, replica.op_repair_min());
+                }
             }
         }
 
+        const cluster_op_repair_min = op_repair_min.?;
         const ReplicaSet = std.StaticBitSet(constants.replicas_max);
         var replicas_missing_ops = try allocator.alloc(
             ReplicaSet,
@@ -784,7 +776,7 @@ pub const Simulator = struct {
                 if (!simulator.core.isSet(replica.replica) or
                     !replica.journal.has_prepare(&header))
                 {
-                    replicas_missing_ops[index].set(replica.replica);
+                    replicas_missing_op.set(replica.replica);
                 }
             }
         }
@@ -793,12 +785,12 @@ pub const Simulator = struct {
             if (replica.standby()) continue;
             if (!simulator.core.isSet(replica.replica)) continue;
 
-            // Lagging replicas do not initiate WAL repair during view change.
-            if (replica.status == .view_change and
-                replica.op_checkpoint() < cluster_op_checkpoint) continue;
-
             // Replicas can only initiate WAL repair in view_change/normal statuses.
             if (replica.status == .recovering_head) continue;
+
+            // Lagging replicas do not initiate WAL repair during view change.
+            if (replica.status == .view_change and
+                vsr.Checkpoint.durable(replica.op_checkpoint_next(), replica.commit_max)) continue;
 
             // First, check whether any of the uncommitted headers is corrupted on more than a nack
             // quorum of replicas. If so, the cluster cannot initiate repair or commit (see the
